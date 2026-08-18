@@ -1,0 +1,7 @@
+# Compiled binaries
+client
+server
+test
+
+# Downloaded certificate (not part of source, downloaded separately)
+mosquitto.org.crt
