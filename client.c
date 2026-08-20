@@ -14,7 +14,6 @@ void handle_sigint(int sig) {
     printf("\nShutting down gracefully...\n");
 }
 
-// Simple config structure
 typedef struct {
     char modbus_ip[64];
     int modbus_port;
@@ -26,7 +25,6 @@ typedef struct {
     int poll_interval_sec;
 } Config;
 
-// Reads config.txt and fills the Config struct
 int load_config(const char *filename, Config *cfg) {
     FILE *f = fopen(filename, "r");
     if (!f) {
@@ -37,7 +35,6 @@ int load_config(const char *filename, Config *cfg) {
     char line[512];
     while (fgets(line, sizeof(line), f)) {
         char key[128], value[256];
-        // Skip blank lines
         if (line[0] == '\n' || line[0] == '#') continue;
 
         if (sscanf(line, "%127[^=]=%255[^\n]", key, value) == 2) {
@@ -56,10 +53,25 @@ int load_config(const char *filename, Config *cfg) {
     return 0;
 }
 
+// Attempts to (re)connect to the Modbus device. Returns a valid ctx or NULL.
+modbus_t *modbus_reconnect(Config *cfg) {
+    modbus_t *ctx = modbus_new_tcp(cfg->modbus_ip, cfg->modbus_port);
+    if (ctx == NULL) {
+        fprintf(stderr, "Failed to create Modbus context\n");
+        return NULL;
+    }
+    if (modbus_connect(ctx) == -1) {
+        fprintf(stderr, "Modbus reconnect failed: %s\n", modbus_strerror(errno));
+        modbus_free(ctx);
+        return NULL;
+    }
+    printf("Modbus (re)connected.\n");
+    return ctx;
+}
+
 int main() {
     signal(SIGINT, handle_sigint);
 
-    // ---- Load configuration ----
     Config cfg;
     memset(&cfg, 0, sizeof(cfg));
     if (load_config("config.txt", &cfg) == -1) {
@@ -72,19 +84,11 @@ int main() {
     printf("  MQTT:   %s:%d, topic '%s'\n", cfg.mqtt_broker, cfg.mqtt_port, cfg.mqtt_topic);
     printf("  Poll interval: %d sec\n\n", cfg.poll_interval_sec);
 
-    // ---- MODBUS: connect once ----
-    modbus_t *ctx = modbus_new_tcp(cfg.modbus_ip, cfg.modbus_port);
+    // ---- Initial Modbus connection ----
+    modbus_t *ctx = modbus_reconnect(&cfg);
     if (ctx == NULL) {
-        fprintf(stderr, "Failed to create Modbus context\n");
         return -1;
     }
-
-    if (modbus_connect(ctx) == -1) {
-        fprintf(stderr, "Modbus connection failed: %s\n", modbus_strerror(errno));
-        modbus_free(ctx);
-        return -1;
-    }
-    printf("Connected to Modbus simulator.\n");
 
     // ---- MQTT: connect once ----
     mosquitto_lib_init();
@@ -108,15 +112,35 @@ int main() {
     printf("Connected to MQTT broker.\n\n");
 
     uint16_t tab_reg[64];
+    int consecutive_failures = 0;
 
-    // ---- MAIN LOOP ----
     while (running) {
         int rc = modbus_read_registers(ctx, cfg.register_start, cfg.register_count, tab_reg);
+
         if (rc == -1) {
-            fprintf(stderr, "Modbus read failed: %s\n", modbus_strerror(errno));
+            consecutive_failures++;
+            fprintf(stderr, "Modbus read failed (%d in a row): %s\n",
+                    consecutive_failures, modbus_strerror(errno));
+
+            // Connection is dead — close it and try to reconnect
+            modbus_close(ctx);
+            modbus_free(ctx);
+
+            printf("Attempting to reconnect to Modbus device...\n");
+            ctx = modbus_reconnect(&cfg);
+
+            if (ctx == NULL) {
+                fprintf(stderr, "Reconnect failed. Will retry in %d sec.\n", cfg.poll_interval_sec);
+            } else {
+                consecutive_failures = 0;
+            }
+
             sleep(cfg.poll_interval_sec);
             continue;
         }
+
+        // Success — reset failure counter
+        consecutive_failures = 0;
 
         float voltage = tab_reg[0] / 10.0;
         float current = tab_reg[1] / 100.0;
@@ -140,8 +164,10 @@ int main() {
     }
 
     printf("Closing connections...\n");
-    modbus_close(ctx);
-    modbus_free(ctx);
+    if (ctx) {
+        modbus_close(ctx);
+        modbus_free(ctx);
+    }
     mosquitto_disconnect(mosq);
     mosquitto_destroy(mosq);
     mosquitto_lib_cleanup();
