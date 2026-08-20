@@ -1,0 +1,9 @@
+[2026-08-20 15:23:33] Starting Modbus-MQTT Bridge
+[2026-08-20 15:23:33] Config: Modbus 127.0.0.1:1502 (registers 0-3), MQTT 127.0.0.1:1883, topic 'klemsan_intern/armaghan/modbus_readings', poll 5sec
+[2026-08-20 15:23:33] Modbus reconnect failed: Connection refused
+[2026-08-20 15:24:44] Starting Modbus-MQTT Bridge
+[2026-08-20 15:24:44] Config: Modbus 127.0.0.1:1502 (registers 0-3), MQTT 127.0.0.1:1883, topic 'klemsan_intern/armaghan/modbus_readings', poll 5sec
+[2026-08-20 15:24:44] Modbus (re)connected
+[2026-08-20 15:24:44] MQTT connected
+[2026-08-20 15:27:49] Shutdown requested (Ctrl+C)
+[2026-08-20 15:27:49] Shutting down gracefully

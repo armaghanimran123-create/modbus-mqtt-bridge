@@ -6,14 +6,19 @@
 #include <errno.h>
 #include <unistd.h>
 #include <signal.h>
+#include <time.h>
+#include <sys/stat.h>
+#include <stdarg.h>
 
 volatile int running = 1;
 
-void handle_sigint(int sig) {
-    running = 0;
-    printf("\nShutting down gracefully...\n");
-}
+// ---- Stats ----
+int total_publishes = 0;
+int modbus_failures = 0;
+int mqtt_failures = 0;
+int uptime_cycles = 0;
 
+// ---- Config ----
 typedef struct {
     char modbus_ip[64];
     int modbus_port;
@@ -25,6 +30,66 @@ typedef struct {
     int poll_interval_sec;
 } Config;
 
+// ---- Logging ----
+void get_timestamp(char *buf, size_t len) {
+    time_t now = time(NULL);
+    struct tm *t = localtime(&now);
+    strftime(buf, len, "%Y-%m-%d %H:%M:%S", t);
+}
+
+void get_date(char *buf, size_t len) {
+    time_t now = time(NULL);
+    struct tm *t = localtime(&now);
+    strftime(buf, len, "%Y-%m-%d", t);
+}
+
+void log_event(const char *message) {
+    // Print to console
+    char ts[32];
+    get_timestamp(ts, sizeof(ts));
+    printf("[%s] %s\n", ts, message);
+
+    // Write to logs/basic/YYYY-MM-DD.log
+    char date[16];
+    get_date(date, sizeof(date));
+
+    char path[128];
+    snprintf(path, sizeof(path), "logs/basic/%s.log", date);
+
+    FILE *f = fopen(path, "a");
+    if (f) {
+        fprintf(f, "[%s] %s\n", ts, message);
+        fclose(f);
+    }
+}
+
+void log_event_fmt(const char *fmt, ...) {
+    char message[512];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(message, sizeof(message), fmt, args);
+    va_end(args);
+    log_event(message);
+}
+
+void write_stats() {
+    FILE *f = fopen("logs/stats/stats.log", "w");
+    if (f) {
+        fprintf(f, "total_publishes=%d\n", total_publishes);
+        fprintf(f, "modbus_failures=%d\n", modbus_failures);
+        fprintf(f, "mqtt_failures=%d\n", mqtt_failures);
+        fprintf(f, "uptime_cycles=%d\n", uptime_cycles);
+        fclose(f);
+    }
+}
+
+void handle_sigint(int sig) {
+    running = 0;
+    log_event("Shutdown requested (Ctrl+C)");
+    write_stats();
+}
+
+// ---- Config loader ----
 int load_config(const char *filename, Config *cfg) {
     FILE *f = fopen(filename, "r");
     if (!f) {
@@ -51,54 +116,58 @@ int load_config(const char *filename, Config *cfg) {
     return 0;
 }
 
+// ---- Modbus reconnect ----
 modbus_t *modbus_reconnect(Config *cfg) {
     modbus_t *ctx = modbus_new_tcp(cfg->modbus_ip, cfg->modbus_port);
     if (ctx == NULL) {
-        fprintf(stderr, "Failed to create Modbus context\n");
+        log_event("Failed to create Modbus context");
         return NULL;
     }
     if (modbus_connect(ctx) == -1) {
-        fprintf(stderr, "Modbus reconnect failed: %s\n", modbus_strerror(errno));
+        log_event_fmt("Modbus reconnect failed: %s", modbus_strerror(errno));
         modbus_free(ctx);
         return NULL;
     }
-    printf("Modbus (re)connected.\n");
+    log_event("Modbus (re)connected");
     return ctx;
 }
 
+// ---- MQTT reconnect ----
 int mqtt_reconnect(struct mosquitto *mosq, Config *cfg) {
-    // Try the built-in reconnect first (reuses existing connection settings)
     int rc = mosquitto_reconnect(mosq);
     if (rc == MOSQ_ERR_SUCCESS) {
-        printf("MQTT (re)connected.\n");
+        log_event("MQTT (re)connected");
         return 0;
     }
-
-    // If that fails, try a full fresh connect
-    fprintf(stderr, "MQTT reconnect failed: %s. Trying fresh connect...\n",
-            mosquitto_strerror(rc));
+    log_event_fmt("MQTT reconnect failed: %s. Trying fresh connect...",
+                  mosquitto_strerror(rc));
     rc = mosquitto_connect(mosq, cfg->mqtt_broker, cfg->mqtt_port, 60);
     if (rc == MOSQ_ERR_SUCCESS) {
-        printf("MQTT (re)connected (fresh).\n");
+        log_event("MQTT (re)connected (fresh)");
         return 0;
     }
-
-    fprintf(stderr, "MQTT fresh connect also failed: %s\n", mosquitto_strerror(rc));
+    log_event_fmt("MQTT fresh connect also failed: %s", mosquitto_strerror(rc));
     return -1;
 }
 
 int main() {
     signal(SIGINT, handle_sigint);
 
+    // Create log directories
+    mkdir("logs", 0755);
+    mkdir("logs/basic", 0755);
+    mkdir("logs/stats", 0755);
+
     Config cfg;
     memset(&cfg, 0, sizeof(cfg));
     if (load_config("config.txt", &cfg) == -1) return -1;
 
-    printf("Loaded config:\n");
-    printf("  Modbus: %s:%d (registers %d-%d)\n", cfg.modbus_ip, cfg.modbus_port,
-           cfg.register_start, cfg.register_start + cfg.register_count - 1);
-    printf("  MQTT:   %s:%d, topic '%s'\n", cfg.mqtt_broker, cfg.mqtt_port, cfg.mqtt_topic);
-    printf("  Poll interval: %d sec\n\n", cfg.poll_interval_sec);
+    log_event("Starting Modbus-MQTT Bridge");
+    log_event_fmt("Config: Modbus %s:%d (registers %d-%d), MQTT %s:%d, topic '%s', poll %dsec",
+        cfg.modbus_ip, cfg.modbus_port,
+        cfg.register_start, cfg.register_start + cfg.register_count - 1,
+        cfg.mqtt_broker, cfg.mqtt_port, cfg.mqtt_topic,
+        cfg.poll_interval_sec);
 
     // ---- Initial Modbus connection ----
     modbus_t *ctx = modbus_reconnect(&cfg);
@@ -108,7 +177,7 @@ int main() {
     mosquitto_lib_init();
     struct mosquitto *mosq = mosquitto_new("modbus_client", true, NULL);
     if (!mosq) {
-        fprintf(stderr, "Failed to create Mosquitto instance\n");
+        log_event("Failed to create Mosquitto instance");
         modbus_close(ctx);
         modbus_free(ctx);
         mosquitto_lib_cleanup();
@@ -116,40 +185,43 @@ int main() {
     }
 
     if (mosquitto_connect(mosq, cfg.mqtt_broker, cfg.mqtt_port, 60) != MOSQ_ERR_SUCCESS) {
-        fprintf(stderr, "Initial MQTT connection failed\n");
+        log_event("Initial MQTT connection failed");
         modbus_close(ctx);
         modbus_free(ctx);
         mosquitto_destroy(mosq);
         mosquitto_lib_cleanup();
         return -1;
     }
-    printf("Connected to MQTT broker.\n\n");
+    log_event("MQTT connected");
+
+    // Initialize stats file
+    write_stats();
 
     uint16_t tab_reg[64];
-    int modbus_failures = 0;
-    int mqtt_failures = 0;
 
     while (running) {
+        uptime_cycles++;
+
         // ---- Modbus read ----
-        int rc = modbus_read_registers(ctx, cfg.register_start, cfg.register_count, tab_reg);
+        int rc = modbus_read_registers(ctx, cfg.register_start,
+                                        cfg.register_count, tab_reg);
         if (rc == -1) {
             modbus_failures++;
-            fprintf(stderr, "Modbus read failed (%d in a row): %s\n",
-                    modbus_failures, modbus_strerror(errno));
+            log_event_fmt("Modbus read failed (%d in a row): %s",
+                          modbus_failures, modbus_strerror(errno));
             modbus_close(ctx);
             modbus_free(ctx);
-            printf("Attempting Modbus reconnect...\n");
             ctx = modbus_reconnect(&cfg);
             if (ctx == NULL) {
-                fprintf(stderr, "Modbus reconnect failed. Retrying in %d sec.\n",
-                        cfg.poll_interval_sec);
+                log_event_fmt("Modbus reconnect failed. Retrying in %d sec.",
+                              cfg.poll_interval_sec);
             } else {
                 modbus_failures = 0;
             }
+            write_stats();
             sleep(cfg.poll_interval_sec);
             continue;
         }
-        modbus_failures = 0;
 
         // ---- Decode values ----
         float voltage      = tab_reg[0] / 10.0;
@@ -168,23 +240,22 @@ int main() {
                                     strlen(payload), payload, 0, false);
         if (prc != MOSQ_ERR_SUCCESS) {
             mqtt_failures++;
-            fprintf(stderr, "MQTT publish failed (%d in a row): %s\n",
-                    mqtt_failures, mosquitto_strerror(prc));
-            printf("Attempting MQTT reconnect...\n");
+            log_event_fmt("MQTT publish failed (%d in a row): %s",
+                          mqtt_failures, mosquitto_strerror(prc));
             if (mqtt_reconnect(mosq, &cfg) == 0) {
                 mqtt_failures = 0;
-            } else {
-                fprintf(stderr, "MQTT reconnect failed. Will retry next cycle.\n");
             }
         } else {
-            mqtt_failures = 0;
-            printf("Published: %s\n", payload);
+            total_publishes++;
+            printf("[Published #%d] %s\n", total_publishes, payload);
         }
 
+        // Write stats every cycle
+        write_stats();
         sleep(cfg.poll_interval_sec);
     }
 
-    printf("Closing connections...\n");
+    log_event("Shutting down gracefully");
     if (ctx) {
         modbus_close(ctx);
         modbus_free(ctx);
